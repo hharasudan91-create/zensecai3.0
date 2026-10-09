@@ -22,6 +22,16 @@ class ZentraSecConnector {
    * calling application's login flow.
    */
   async sendEvent(eventType, metadata = {}) {
+    console.log("[BROWSER TEST] sendEvent EXECUTED:", eventType);
+    // Ensure a secure token is present before attempting to send any event
+    if (!this.secureToken) {
+      console.error('[ZentraSec] Secure Token is required to send security events.');
+      // Show a UI message if possible – the SDK itself cannot manipulate the DOM,
+      // but the caller (Demo‑Portal) can decide how to surface this error.
+      return null;
+    }
+
+    console.log('[DEBUG ZENTRASEC] sendEvent called', 'event_type='+eventType);
     const payload = {
       connection_id: this.connectionId,
       timestamp: new Date().toISOString(),
@@ -47,8 +57,10 @@ class ZentraSecConnector {
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
-        // Log failure — do NOT alert the user or throw
+        // Log the HTTP status and backend error message for debugging (without leaking the token)
         console.error(`[ZentraSec] Event rejected: HTTP ${response.status}`);
+        const errorBody = await response.text();
+        console.error('[ZentraSec] Backend response:', errorBody);
         return null;
       }
       const result = await response.json();
@@ -67,7 +79,7 @@ class ZentraSecConnector {
 
   /**
    * Called by DevHub when login FAILS.
-   * Sends a LOGIN_FAILURE event (recognised by rules_engine BASE_SCORES and
+   * Sends a LOGIN_FAILED event (recognised by rules_engine BASE_SCORES and
    * ENRICHMENT_EVENT_TYPES). Includes user identifier, failure reason, and
    * application context. Real source IP is captured by the backend.
    *
@@ -76,8 +88,10 @@ class ZentraSecConnector {
    * @param {string}      reason        - Human-readable failure reason
    */
   async trackLoginFailure(username, _targetUserId = null, reason = "Invalid credentials") {
+    console.log("[BROWSER TEST] trackLoginFailure EXECUTED");
     this.setUserId(username);
-    return this.sendEvent("LOGIN_FAILURE", {
+    console.log('[DEBUG ZENTRASEC] trackLoginFailure called', 'user:', username);
+    return this.sendEvent("LOGIN_FAILED", {
       failure_reason: reason,
       method: "password",
       authentication_status: "FAILED",
@@ -131,3 +145,5 @@ class ZentraSecConnector {
   async register(username)         { return this.sendEvent("USER_REGISTRATION", { username }); }
   async resetPassword(username)    { return this.sendEvent("PASSWORD_RESET_REQUEST", { username }); }
 }
+
+console.log("[BROWSER TEST] ZentraSecConnector.js LOADED");

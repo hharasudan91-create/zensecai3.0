@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Activity, Lock, ShieldAlert, Globe, PowerOff, Plus, AlertCircle, RefreshCw } from 'lucide-react';
+import { Activity, Lock, ShieldAlert, Globe, PowerOff, Plus, AlertCircle, RefreshCw, Ban } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ReferenceArea, Area, ResponsiveContainer } from 'recharts';
 
 export default function AnalyticsPage() {
@@ -20,8 +20,28 @@ export default function AnalyticsPage() {
   const [faultExplanation, setFaultExplanation] = useState<any>(null);
   
   const [blockTimer, setBlockTimer] = useState<number | null>(null);
+  const [blockPageTimer, setBlockPageTimer] = useState<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? 'http://127.0.0.1:8000';
+  const demoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const demoIndexRef = useRef<number>(0);
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
+
+  // Simulated score sequence for demo/presentation graph only.
+  // These values are NEVER sent to the backend or WebSocket.
+  const DEMO_SCORES: { score: number; risk_band: string }[] = [
+    { score: 32, risk_band: 'LOW' },
+    { score: 41, risk_band: 'LOW' },
+    { score: 38, risk_band: 'LOW' },
+    { score: 55, risk_band: 'MEDIUM' },
+    { score: 47, risk_band: 'MEDIUM' },
+    { score: 63, risk_band: 'MEDIUM' },
+    { score: 58, risk_band: 'MEDIUM' },
+    { score: 72, risk_band: 'HIGH' },
+    { score: 68, risk_band: 'HIGH' },
+    { score: 81, risk_band: 'CRITICAL' },
+    { score: 76, risk_band: 'HIGH' },
+    { score: 69, risk_band: 'HIGH' },
+  ];
 
   const fetchConnections = async () => {
   try {
@@ -47,6 +67,16 @@ export default function AnalyticsPage() {
     }
     return () => clearInterval(timerId);
   }, [blockTimer]);
+
+  useEffect(() => {
+    let timerId: any;
+    if (blockPageTimer !== null && blockPageTimer > 0) {
+      timerId = setInterval(() => {
+        setBlockPageTimer(prev => (prev && prev > 0 ? prev - 1 : 0));
+      }, 1000);
+    }
+    return () => clearInterval(timerId);
+  }, [blockPageTimer]);
 
   const handleAddConnection = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -95,9 +125,25 @@ export default function AnalyticsPage() {
     setSecurityEvents([]);
     setChartData([]);
     setFaultExplanation(null);
-    
+    demoIndexRef.current = 0;
+
     if (wsRef.current) wsRef.current.close();
-    
+
+    // ── Demo ticker: feeds simulated score values into the graph every 2 s.
+    // This is purely for visual presentation and does NOT touch the backend,
+    // WebSocket logic, SECURITY_EVENT pipeline, or event feed table.
+    if (demoIntervalRef.current) clearInterval(demoIntervalRef.current);
+    demoIntervalRef.current = setInterval(() => {
+      const idx = demoIndexRef.current % DEMO_SCORES.length;
+      const point = DEMO_SCORES[idx];
+      demoIndexRef.current += 1;
+      const timeStr = new Date().toLocaleTimeString();
+      setChartData(prev => {
+        const updated = [...prev, { time: timeStr, score: point.score, risk_band: point.risk_band, demo: true }];
+        return updated.slice(-20);
+      });
+    }, 2000);
+
     console.log('[ZentraSec WS] Connecting to', `${apiBase.replace(/^http/, 'ws')}/api/v1/ws/security-flow/${selectedConnection}`);
     const ws = new WebSocket(`${apiBase.replace(/^http/, 'ws')}/api/v1/ws/security-flow/${selectedConnection}`);
 
@@ -118,32 +164,42 @@ export default function AnalyticsPage() {
         setSecurityEvents(prev => [data, ...prev].slice(0, 50));
         setChartData(prev => {
           const newData = [...prev, { time: timeStr, score: data.anomaly_score, risk_band: data.risk_band }];
-          return newData.slice(-20); // Keep last 20 points
+          return newData.slice(-20);
         });
       } else if (data.type === 'FAULT_EXPLANATION') {
         setFaultExplanation(data);
-      } else if (data.type === 'FLOW_UPDATE' && chartData.length === 0) {
-        // Just feed some zeroes if no events so chart isn't empty
-        setChartData(prev => {
-           if (prev.length > 0) return prev;
-           return [{ time: timeStr, score: 0 }];
-        });
       }
     };
-    
+
     wsRef.current = ws;
   };
   
   const disconnect = () => {
     if (wsRef.current) wsRef.current.close();
+    if (demoIntervalRef.current) { clearInterval(demoIntervalRef.current); demoIntervalRef.current = null; }
     setIsConnected(false);
   };
 
   const handleBlockAccount = () => {
-    setBlockTimer(420); // 7 minutes
-    fetch(`${apiBase}/api/v1/incidents/SIMULATED/suspend-7min`, {
+    setBlockTimer(10); // 10 seconds
+    fetch(`${apiBase}/api/v1/incidents/SIMULATED/suspend-10sec`, {
         method: 'POST'
       }).catch(console.error);
+  };
+
+  const handleBlockPage = async () => {
+    if (!selectedConnection) return;
+    try {
+      const res = await fetch(`${apiBase}/api/v1/connections/${selectedConnection}/block-page`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setBlockPageTimer(data.mitigation_time || 10);
+      }
+    } catch (err) {
+      console.error('[ZentraSec] Block Page action failed', err);
+    }
   };
 
   const formatTimer = (seconds: number) => {
@@ -269,7 +325,15 @@ const CustomDot = (props: any) => {
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               
               {/* Waveform Chart */}
-              <div className="lg:col-span-2 bg-zinc-900/80 border border-zinc-800 rounded-xl p-6 shadow-xl">
+              <div className="lg:col-span-2 bg-zinc-900/80 border border-zinc-800 rounded-xl p-6 shadow-xl relative">
+                {/* DEMO DATA badge — clearly marks graph as simulated */}
+                <div className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 border border-amber-500/40 select-none">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
+                  </span>
+                  <span className="text-xs font-semibold tracking-widest uppercase text-amber-400">Simulated Data</span>
+                </div>
                 <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
                   <Activity className="text-emerald-400 w-5 h-5" />
                   Live Activity Waveform (Anomaly Score)
@@ -398,16 +462,29 @@ const CustomDot = (props: any) => {
               </div>
             </div>
             
-            {/* Incident Mitigation & Block Action */}
+            {/* Incident Mitigation & Block Actions */}
             <div className="bg-zinc-900/80 border border-zinc-800 rounded-xl p-6 shadow-xl relative overflow-hidden">
-               {blockTimer !== null && blockTimer > 0 && (
+               {((blockTimer !== null && blockTimer > 0) || (blockPageTimer !== null && blockPageTimer > 0)) && (
                  <div className="absolute inset-0 bg-red-950/20 backdrop-blur-[1px] pointer-events-none border border-red-500/30 rounded-xl z-10 flex items-center justify-center">
-                    <div className="bg-red-950/90 border border-red-500/50 px-6 py-4 rounded-xl shadow-2xl flex items-center gap-4 animate-pulse">
-                       <Lock className="text-red-500 w-8 h-8" />
-                       <div>
-                         <h3 className="text-red-400 font-bold text-lg">ACCOUNT BLOCKED</h3>
-                         <p className="text-red-200 font-mono text-2xl">{formatTimer(blockTimer)}</p>
-                       </div>
+                    <div className="flex flex-col gap-3">
+                      {blockTimer !== null && blockTimer > 0 && (
+                        <div className="bg-red-950/90 border border-red-500/50 px-6 py-4 rounded-xl shadow-2xl flex items-center gap-4 animate-pulse">
+                           <Lock className="text-red-500 w-8 h-8" />
+                           <div>
+                             <h3 className="text-red-400 font-bold text-lg">ACCOUNT BLOCKED</h3>
+                             <p className="text-red-200 font-mono text-2xl">{formatTimer(blockTimer)}</p>
+                           </div>
+                        </div>
+                      )}
+                      {blockPageTimer !== null && blockPageTimer > 0 && (
+                        <div className="bg-orange-950/90 border border-orange-500/50 px-6 py-4 rounded-xl shadow-2xl flex items-center gap-4 animate-pulse">
+                           <Ban className="text-orange-500 w-8 h-8" />
+                           <div>
+                             <h3 className="text-orange-400 font-bold text-lg">PAGE ACCESS BLOCKED</h3>
+                             <p className="text-orange-200 font-mono text-2xl">{formatTimer(blockPageTimer)}</p>
+                           </div>
+                        </div>
+                      )}
                     </div>
                  </div>
                )}
@@ -419,21 +496,37 @@ const CustomDot = (props: any) => {
                  </h3>
                </div>
                
-               <p className="text-zinc-400 text-sm mb-6">If critical or unsolved anomalous login activity is detected on the customer's asset memory, you can temporarily suspend their account to stop website operations.</p>
+               <p className="text-zinc-400 text-sm mb-6">If critical or unsolved anomalous login activity is detected on the customer's asset memory, you can temporarily suspend their account or block page access to contain immediate threats.</p>
                
-               <div className="flex items-center gap-6 p-4 bg-zinc-950 border border-zinc-800 rounded-lg">
-                 <div className="flex-1">
-                   <h4 className="font-semibold text-zinc-200 mb-1">Temporary User Block (7 Minutes)</h4>
-                   <p className="text-xs text-zinc-500">Instantly drops all active sessions and blocks incoming authentication for 7 minutes to contain immediate threats.</p>
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                 <div className="flex items-center gap-4 p-4 bg-zinc-950 border border-zinc-800 rounded-lg">
+                   <div className="flex-1">
+                     <h4 className="font-semibold text-zinc-200 mb-1">Block Login (10 Seconds)</h4>
+                     <p className="text-xs text-zinc-500">Drops all active sessions and blocks incoming authentication for 7 minutes.</p>
+                   </div>
+                   <button 
+                     onClick={handleBlockAccount}
+                     disabled={blockTimer !== null && blockTimer > 0}
+                     className="px-5 py-2 bg-red-600 hover:bg-red-500 disabled:opacity-50 disabled:hover:bg-red-600 rounded text-sm font-medium transition-colors flex items-center gap-2 whitespace-nowrap"
+                   >
+                     <Lock size={16} />
+                     {blockTimer !== null && blockTimer > 0 ? 'Blocked' : '🔒 Block Login'}
+                   </button>
                  </div>
-                 <button 
-                   onClick={handleBlockAccount}
-                   disabled={blockTimer !== null && blockTimer > 0}
-                   className="px-5 py-2 bg-red-600 hover:bg-red-500 disabled:opacity-50 disabled:hover:bg-red-600 rounded text-sm font-medium transition-colors flex items-center gap-2 whitespace-nowrap"
-                 >
-                   <Lock size={16} />
-                   {blockTimer !== null && blockTimer > 0 ? 'Blocked' : 'Block for 7 Mins'}
-                 </button>
+                 <div className="flex items-center gap-4 p-4 bg-zinc-950 border border-zinc-800 rounded-lg">
+                   <div className="flex-1">
+                     <h4 className="font-semibold text-zinc-200 mb-1">Block Page (7 Minutes)</h4>
+                     <p className="text-xs text-zinc-500">Restricts access to the connected application page for 7 minutes.</p>
+                   </div>
+                   <button 
+                     onClick={handleBlockPage}
+                     disabled={(blockPageTimer !== null && blockPageTimer > 0) || !selectedConnection}
+                     className="px-5 py-2 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:hover:bg-orange-600 rounded text-sm font-medium transition-colors flex items-center gap-2 whitespace-nowrap"
+                   >
+                     <Ban size={16} />
+                     {blockPageTimer !== null && blockPageTimer > 0 ? 'Blocked' : '🚫 Block Page'}
+                   </button>
+                 </div>
                </div>
             </div>
 

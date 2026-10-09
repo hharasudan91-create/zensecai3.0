@@ -70,6 +70,13 @@ class ThreatIntelligence(Base):
     last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime)
     status: Mapped[str] = mapped_column(String(32), default="active")
     is_simulated: Mapped[bool] = mapped_column(Boolean, default=True)
+    # New TI fields (all Optional so existing rows / SQLite alters are safe)
+    threat_actor: Mapped[Optional[str]] = mapped_column(String(128))
+    campaign: Mapped[Optional[str]] = mapped_column(String(255))
+    country: Mapped[Optional[str]] = mapped_column(String(8))
+    organization: Mapped[Optional[str]] = mapped_column(String(255))
+    asn: Mapped[Optional[str]] = mapped_column(String(64))
+    mitre_techniques: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     raw_result: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

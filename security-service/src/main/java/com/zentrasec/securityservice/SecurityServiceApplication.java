@@ -1,0 +1,1 @@
+package com.zentrasec.securityservice;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class SecurityServiceApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(SecurityServiceApplication.class, args);\n    }\n}

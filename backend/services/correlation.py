@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
 import uuid
+import logging
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger("zentrasec")
 
 from models import SecurityEvent, Incident, IncidentEvent, AttackTimeline, WebsiteConnection
 from schemas import EventIngestRequest
@@ -100,7 +103,7 @@ class CorrelationEngine:
 
         score, classification, ml_status = anomaly_service.score_event(event_dict, context)
 
-        # Rules engine - brute force / correlation detections (tasks 2.3 & 2.4)
+        # Rules engine - brute force / correlation detections
         rules = RulesEngine(self.db).evaluate(
             request.event_type, request.user_id, effective_ip, connection_id, timestamp
         )
@@ -108,12 +111,70 @@ class CorrelationEngine:
             score = max(score, rules["score"])
             classification = rules["risk_band"]
 
+        # ---------------------------------------------------------
+        # THREAT INTELLIGENCE ENRICHMENT
+        # ---------------------------------------------------------
+        from services.threat_intel import ThreatIntelService, detect_ioc_type
+        ti_svc = ThreatIntelService(self.db)
+        
+        ti_result = None
+        ti_status = "pending"
+        
+        # Check source_ip first
+        if effective_ip and detect_ioc_type(effective_ip):
+            ti_result = ti_svc.lookup_ioc(effective_ip, "ipv4")
+        
+        # If not an IP, try metadata for other IOCs
+        if not ti_result and request.metadata:
+            for key, val in request.metadata.items():
+                if isinstance(val, str) and detect_ioc_type(val):
+                    ti_result = ti_svc.lookup_ioc(val)
+                    break
+        
+        if ti_result:
+            if "error" in ti_result:
+                ti_status = "error"
+                ti_result = None
+            elif ti_result.get("reputation") == "UNKNOWN":
+                ti_status = "not_found"
+            else:
+                ti_status = "enriched"
+                
+                # Dynamic Risk Adjustment based on Threat Intel
+                rep = ti_result.get("reputation")
+                ti_score = ti_result.get("threat_score", 0)
+                
+                # If we have a malicious IOC, significantly boost the base score
+                if rep == "MALICIOUS":
+                    # E.g., boost score by the TI score, up to max 100
+                    score = min(100.0, score + max(50.0, ti_score * 0.8))
+                    classification = "CRITICAL"
+                    rules["detections"].append(
+                        f"Threat Intel match: {rep} ({ti_result.get('threat_actor', 'Unknown Actor')})"
+                    )
+                elif rep == "SUSPICIOUS":
+                    score = min(100.0, score + max(25.0, ti_score * 0.5))
+                    if classification == "LOW":
+                        classification = "MEDIUM"
+                    rules["detections"].append("Threat Intel match: SUSPICIOUS")
+                    
+                rules["score"] = score
+                rules["risk_band"] = classification
+
+
+        logger.info("[DEBUG CORRELATION] event_type=%s", request.event_type)
+        logger.info("[DEBUG CORRELATION] score=%s", score)
+        logger.info("[DEBUG CORRELATION] risk_band=%s", classification)
+        logger.info("[DEBUG CORRELATION] security_event_created=true")
+
+# Create SecurityEvent record
+        dest = request.metadata.get('destination') if isinstance(request.metadata, dict) else None
         sec_event = SecurityEvent(
             event_id=event_id,
             timestamp=timestamp,
             user_id=request.user_id,
             source_ip=effective_ip,
-            destination=request.destination,
+            destination=dest,
             device_id=request.device_id,
             event_type=request.event_type,
             severity=request.severity,
@@ -123,7 +184,8 @@ class CorrelationEngine:
             anomaly_score=score,
             anomaly_classification=classification,
             connection_id=connection_id,
-            ml_status=ml_status
+            ml_status=ml_status,
+            ti_status=ti_status
         )
         self.db.add(sec_event)
         self.db.commit()
@@ -131,6 +193,7 @@ class CorrelationEngine:
 
         self.correlate(sec_event)
         sec_event.rules_result = rules  # transient attribute, not persisted
+        sec_event.threat_intel = ti_result  # transient attribute, not persisted
         return sec_event
 
     def correlate(self, new_event: SecurityEvent):

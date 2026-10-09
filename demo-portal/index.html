@@ -14,6 +14,14 @@
         .danger:hover { background: #a71d2a; }
         .success { background: #28a745; }
         .success:hover { background: #1e7e34; }
+        .block-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; z-index:9999; background:linear-gradient(135deg,#0a0a14 0%,#0f0f23 50%,#0a0a14 100%); align-items:center; justify-content:center; flex-direction:column; font-family:sans-serif; }
+        .block-overlay .shield { font-size:56px; margin-bottom:8px; }
+        .block-overlay .brand { color:#10b981; font-size:28px; font-weight:700; letter-spacing:3px; margin-bottom:36px; }
+        .block-overlay .title { color:#ef4444; font-size:22px; font-weight:800; letter-spacing:4px; margin-bottom:28px; text-transform:uppercase; }
+        .block-overlay .msg { color:#a1a1aa; font-size:14px; margin:4px 0; font-style:italic; }
+        .block-overlay .countdown-label { color:#d4d4d8; font-size:14px; margin-top:28px; }
+        .block-overlay .countdown { color:#f97316; font-size:52px; font-weight:700; font-family:monospace; margin:8px 0 28px; }
+        .block-overlay .footer { color:#52525b; font-size:12px; letter-spacing:1.5px; }
     </style>
 </head>
 <body>
@@ -44,9 +52,66 @@
         </div>
     </div>
 
+    <div id="block-overlay" class="block-overlay">
+        <div style="text-align:center;">
+            <div class="shield">🛡️</div>
+            <div class="brand">ZentraSec</div>
+            <div class="title">Access Temporarily Blocked</div>
+            <p class="msg">Suspicious activity was detected on this application.</p>
+            <p class="msg">Access has been temporarily restricted by ZentraSec.</p>
+            <div class="countdown-label">Remaining</div>
+            <div class="countdown" id="block-countdown">0:00</div>
+            <div class="footer">Protected by ZentraSec AI</div>
+        </div>
+    </div>
+
     <script src="ZentraSecConnector.js?v=2"></script>
     <script>
         let sdk = null;
+        let blockPollInterval = null;
+
+        function startBlockStatusPolling() {
+            if (blockPollInterval) clearInterval(blockPollInterval);
+            var apiUrl = document.getElementById("apiUrl").value;
+            var connId = document.getElementById("connId").value;
+            if (!connId || !apiUrl) return;
+
+            function checkStatus() {
+                fetch(apiUrl + "/api/v1/connections/" + connId + "/block-status")
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        var overlay = document.getElementById("block-overlay");
+                        if (data.blocked) {
+                            overlay.style.display = "flex";
+                            var mins = Math.floor(data.remaining_seconds / 60);
+                            var secs = data.remaining_seconds % 60;
+                            document.getElementById("block-countdown").textContent =
+                                mins + ":" + secs.toString().padStart(2, "0");
+                        } else {
+                            overlay.style.display = "none";
+                        }
+                    })
+                    .catch(function(e) { /* silently ignore polling errors */ });
+            }
+
+            checkStatus();
+            blockPollInterval = setInterval(checkStatus, 2000);
+        }
+
+        // Restore connection config and check block status on page load
+        (function() {
+            var storedConnId = localStorage.getItem("zentrasec_conn_id");
+            var storedApiUrl = localStorage.getItem("zentrasec_api_url");
+            if (storedConnId) {
+                document.getElementById("connId").value = storedConnId;
+            }
+            if (storedApiUrl) {
+                document.getElementById("apiUrl").value = storedApiUrl;
+            }
+            if (storedConnId && storedApiUrl) {
+                startBlockStatusPolling();
+            }
+        })();
 
         function initSDK() {
             const apiUrl = document.getElementById("apiUrl").value;
@@ -58,14 +123,25 @@
                 return;
             }
             
+            // Persist connection config for block-status polling across refreshes
+            localStorage.setItem("zentrasec_conn_id", connId);
+            localStorage.setItem("zentrasec_api_url", apiUrl);
+            
             sdk = new ZentraSecConnector(apiUrl, connId, token);
             document.getElementById("sdk-status").innerText = "Status: Initialized and tracking activity.";
             document.getElementById("sdk-status").style.color = "green";
+            startBlockStatusPolling();
         }
 
         function handleLogin(event) {
             event.preventDefault();
             if (!sdk) return alert("Initialize SDK first!");
+            // Verify that a Secure Token has been supplied
+            const token = document.getElementById("token").value.trim();
+            if (!token) {
+                document.getElementById("loginMessage").innerText = "Secure Token is required to send security events.";
+                return;
+            }
             const username = document.getElementById("username").value;
             const password = document.getElementById("password").value;
             // Simple demo authentication logic
@@ -76,6 +152,9 @@
                     document.getElementById("postLoginActions").style.display = "block";
                 });
             } else {
+                console.log('[BROWSER TEST] handleLogin FAILED branch EXECUTED');
+                console.log('[DEBUG DEVHUB] Login failed');
+                console.log('[DEBUG DEVHUB] Calling ZentraSec trackLoginFailure');
                 sdk.trackLoginFailure(username, null, "Invalid credentials").then(() => {
                     document.getElementById("loginMessage").innerText = "Invalid credentials";
                     document.getElementById("postLoginActions").style.display = "none";

@@ -39,20 +39,76 @@ if inspector.has_table("website_connections"):
         print("Schema changed (status column missing in website_connections). Recreating database...")
         models.Base.metadata.drop_all(bind=engine)
 
+# Safe SQLite migration: add new ThreatIntelligence columns if they don't exist yet.
+_TI_NEW_COLUMNS = [
+    ("threat_actor",     "VARCHAR(128)"),
+    ("campaign",         "VARCHAR(255)"),
+    ("country",          "VARCHAR(8)"),
+    ("organization",     "VARCHAR(255)"),
+    ("asn",              "VARCHAR(64)"),
+    ("mitre_techniques", "JSON"),
+]
+if inspector.has_table("threat_intelligence"):
+    _existing_ti_cols = {col["name"] for col in inspector.get_columns("threat_intelligence")}
+    with engine.connect() as _conn:
+        for _col_name, _col_type in _TI_NEW_COLUMNS:
+            if _col_name not in _existing_ti_cols:
+                print(f"[Migration] Adding column threat_intelligence.{_col_name}")
+                _conn.execute(
+                    sqlalchemy.text(f"ALTER TABLE threat_intelligence ADD COLUMN {_col_name} {_col_type}")
+                )
+        _conn.commit()
+
 models.Base.metadata.create_all(bind=engine)
 
-# Seed initial connection if none exists
+
+# Seed initial connection if none exists; ensure it always has a secure_token.
+# IMPORTANT: If ZENTRASEC_TOKEN env var is set, it is used as the canonical token
+# so the DB always matches what DevHub's vite.config.ts sends.
+import secrets as _secrets
+import os as _os
+
+_ENV_TOKEN = _os.environ.get("ZENTRASEC_TOKEN", "").strip()
+
 with Session(engine) as db:
-    if not db.query(models.WebsiteConnection).first():
+    default_conn = db.query(models.WebsiteConnection).filter(
+        models.WebsiteConnection.connection_id == "default-zensec-001"
+    ).first()
+    if not default_conn:
+        # First run: create with env token if provided, else generate one
+        _token = _ENV_TOKEN if _ENV_TOKEN else _secrets.token_hex(32)
         default_conn = models.WebsiteConnection(
             connection_id="default-zensec-001",
+            secure_token=_token,
             website_url="https://admin.zensec.ai",
             customer_name="Zensec Default Customer"
         )
         db.add(default_conn)
         db.commit()
+        logger.info("[STARTUP] Created default connection: default-zensec-001")
+        logger.info("[STARTUP] Token source: %s", "ZENTRASEC_TOKEN env" if _ENV_TOKEN else "generated")
+    elif not default_conn.secure_token:
+        # Patch: existing row was seeded without a token
+        _token = _ENV_TOKEN if _ENV_TOKEN else _secrets.token_hex(32)
+        default_conn.secure_token = _token
+        db.commit()
+        logger.info("[STARTUP] Patched missing token for default-zensec-001")
+    elif _ENV_TOKEN and default_conn.secure_token != _ENV_TOKEN:
+        # Token mismatch: ZENTRASEC_TOKEN env overrides the stored token so
+        # the backend stays in sync with DevHub's vite.config.ts.
+        default_conn.secure_token = _ENV_TOKEN
+        db.commit()
+        logger.info("[STARTUP] Updated default-zensec-001 token to match ZENTRASEC_TOKEN env")
+    else:
+        logger.info("[STARTUP] default-zensec-001 OK (token aligned)")
 
 app = FastAPI(title="ZentraSec API", description="AI-Powered Cybersecurity APIs", version="1.0.0")
+
+# ---------------------------------------------------------------------------
+# In-memory page-block ledger: connection_id → expiry datetime (UTC).
+# This is the source-of-truth for the "Block Page" mitigation action.
+# ---------------------------------------------------------------------------
+_page_blocks: dict[str, datetime] = {}
 
 # ---------------------------------------------------------------------------
 # CORS — explicit origins; "*" is kept for development convenience but
@@ -257,6 +313,8 @@ async def generate_ai_explanation(enriched: dict):
 
 @app.post("/api/v1/events")
 async def ingest_event(request: EventIngestRequest, http_request: Request, db: Session = Depends(get_db)):
+    # DEBUG EVENT - entry point
+    logger.info("[DEBUG EVENT] request received")
     try:
         # Extract actual client IP
         client_ip = http_request.client.host if http_request.client else request.source_ip
@@ -266,10 +324,13 @@ async def ingest_event(request: EventIngestRequest, http_request: Request, db: S
 
         # Connection and token validation
         connection_id = request.connection_id
+        logger.info(f"[DEBUG EVENT] connection_id={connection_id}")
+        logger.info(f"[DEBUG EVENT] event_type={request.event_type}")
         auth_header = http_request.headers.get("authorization") or http_request.headers.get("Authorization")
         token = None
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1]
+        logger.info(f"[DEBUG EVENT] token_present={'true' if token else 'false'}")
         from models import WebsiteConnection
         db_conn = db.query(WebsiteConnection).filter(WebsiteConnection.connection_id == connection_id).first()
         if not db_conn:
@@ -279,12 +340,15 @@ async def ingest_event(request: EventIngestRequest, http_request: Request, db: S
             logger.warning("[ZENTRASEC] Invalid token for connection %s", connection_id)
             raise HTTPException(status_code=401, detail="Invalid secure token")
 
-        # Log received event
+        # Log received event details
         logger.info("[ZENTRASEC EVENT RECEIVED] Connection ID: %s | Event Type: %s | Source IP: %s | Timestamp: %s",
                     connection_id, request.event_type, client_ip, request.timestamp)
 
         engine = CorrelationEngine(db)
+        logger.info("[DEBUG EVENT] correlation started")
         event = engine.process_event(request, client_ip=client_ip)
+        logger.info("[DEBUG EVENT] correlation completed")
+        logger.info("[DEBUG EVENT] ingestion_success=true")
 
         rules = getattr(event, "rules_result", None) or {
             "score": event.anomaly_score or 0,
@@ -293,7 +357,7 @@ async def ingest_event(request: EventIngestRequest, http_request: Request, db: S
             "fault_description": None,
         }
 
-        # 2.2 - real-time risk scoring with demo risk bands
+        # Enrich for WS broadcast
         enriched = {
             "type": "SECURITY_EVENT",
             "event_id": event.event_id,
@@ -308,10 +372,13 @@ async def ingest_event(request: EventIngestRequest, http_request: Request, db: S
             "detections": rules.get("detections", []),
             "fault_description": rules.get("fault_description"),
             "metadata": request.metadata,
+            "threat_intel": getattr(event, "threat_intel", None),
         }
 
-        # 3.1 - stream the fully enriched event to the SOC dashboard
+        # DEBUG WS broadcast
+        logger.info(f"[DEBUG WS] SECURITY_EVENT broadcast | connection_id={event.connection_id} | event_type={event.event_type} | anomaly_score={enriched['anomaly_score']} | risk_band={enriched['risk_band']}")
         await manager.broadcast(enriched, event.connection_id)
+
 
         # 2.5 - trigger AI Copilot dynamically for correlated faults
         if enriched["fault_description"]:
@@ -326,7 +393,7 @@ async def ingest_event(request: EventIngestRequest, http_request: Request, db: S
         }
     except Exception as e:
         logger.exception("Error processing event ingestion")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {repr(e)}")
 
 @app.post("/api/v1/simulate/timeline")
 def simulate_timeline(db: Session = Depends(get_db)):
@@ -480,7 +547,7 @@ def create_connection(conn: WebsiteConnectionCreate, db: Session = Depends(get_d
 def get_connections(db: Session = Depends(get_db)):
     return db.query(models.WebsiteConnection).all()
 
-@app.post("/api/v1/incidents/{incident_id}/suspend-7min")
+@app.post("/api/v1/incidents/{incident_id}/suspend-10sec")
 async def suspend_account_7min(incident_id: str, db: Session = Depends(get_db)):
     incident = db.query(models.Incident).filter(models.Incident.incident_id == incident_id).first()
     if not incident:
@@ -491,10 +558,55 @@ async def suspend_account_7min(incident_id: str, db: Session = Depends(get_db)):
     
     return {
         "status": "Success",
-        "message": "User account temporarily blocked for 7 minutes.",
+        "message": "User account temporarily blocked for 10 seconds.",
         "incident_id": incident_id,
-        "mitigation_time": 420
+        "mitigation_time": 10
     }
+
+
+# ---------------------------------------------------------------------------
+# Block Page mitigation — temporarily blocks all access to a connected app.
+# The in-memory _page_blocks dict is the source-of-truth.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/connections/{connection_id}/block-page")
+async def block_page(connection_id: str, db: Session = Depends(get_db)):
+    """Activate a 7-minute page block for the given connection."""
+    conn = db.query(models.WebsiteConnection).filter(
+        models.WebsiteConnection.connection_id == connection_id
+    ).first()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    expiry = datetime.utcnow() + timedelta(seconds=10)
+    _page_blocks[connection_id] = expiry
+    logger.info("[BLOCK-PAGE] Activated for %s until %s", connection_id, expiry.isoformat())
+
+    return {
+        "status": "Success",
+        "message": f"Page access blocked for 10 seconds on {connection_id}.",
+        "connection_id": connection_id,
+        "expiry": expiry.isoformat(),
+        "mitigation_time": 10
+    }
+
+
+@app.get("/api/v1/connections/{connection_id}/block-status")
+async def get_block_status(connection_id: str):
+    """Check whether page access is currently blocked for a connection.
+
+    DevHub polls this endpoint (via its Vite proxy) to decide whether
+    to render the security block page.  The server-side expiry is the
+    single source of truth so a browser refresh cannot bypass the block.
+    """
+    expiry = _page_blocks.get(connection_id)
+    if expiry is None or datetime.utcnow() >= expiry:
+        # Expired or never set — clean up and return unblocked
+        _page_blocks.pop(connection_id, None)
+        return {"blocked": False, "remaining_seconds": 0}
+
+    remaining = int((expiry - datetime.utcnow()).total_seconds())
+    return {"blocked": True, "remaining_seconds": max(remaining, 0)}
 
 @app.websocket("/api/v1/ws/security-flow/{connection_id}")
 async def websocket_endpoint(websocket: WebSocket, connection_id: str):
@@ -528,3 +640,99 @@ async def websocket_endpoint(websocket: WebSocket, connection_id: str):
     except WebSocketDisconnect:
         manager.disconnect(websocket, connection_id)
 
+
+# ---------------------------------------------------------------------------
+# Threat Intelligence API
+# ---------------------------------------------------------------------------
+from services.threat_intel import ThreatIntelService, validate_ioc
+
+@app.get("/api/v1/threat-intel/summary")
+def get_ti_summary(db: Session = Depends(get_db)):
+    """Return counts of IOCs by reputation category."""
+    try:
+        svc = ThreatIntelService(db)
+        return svc.get_summary()
+    except Exception as exc:
+        print("[TI] summary error:", exc)
+        raise HTTPException(status_code=500, detail="Failed to load threat intelligence summary")
+
+
+@app.get("/api/v1/threat-intel/iocs")
+def get_ti_iocs(limit: int = 50, db: Session = Depends(get_db)):
+    """Return the most recently seen IOCs (max 100)."""
+    limit = min(limit, 100)
+    try:
+        svc = ThreatIntelService(db)
+        return {"iocs": svc.get_recent_iocs(limit=limit)}
+    except Exception as exc:
+        print("[TI] iocs list error:", exc)
+        raise HTTPException(status_code=500, detail="Failed to load IOC list")
+
+
+@app.get("/api/v1/threat-intel/ioc/{indicator:path}")
+def get_ti_ioc(indicator: str, db: Session = Depends(get_db)):
+    """Look up a single IOC (IP / domain / URL / hash) by value."""
+    valid, ioc_type, err = validate_ioc(indicator)
+    if not valid:
+        raise HTTPException(status_code=422, detail=err)
+    try:
+        svc = ThreatIntelService(db)
+        result = svc.lookup_ioc(indicator, ioc_type)
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("[TI] ioc lookup error:", exc)
+        raise HTTPException(status_code=500, detail="Threat intelligence lookup failed")
+
+
+from schemas import ThreatIntelLookupRequest
+
+@app.post("/api/v1/threat-intel/lookup")
+def lookup_ti_ioc(request: ThreatIntelLookupRequest, db: Session = Depends(get_db)):
+    """POST-based IOC lookup using the existing ThreatIntelLookupRequest schema."""
+    valid, ioc_type, err = validate_ioc(request.indicator)
+    if not valid:
+        raise HTTPException(status_code=422, detail=err)
+    try:
+        svc = ThreatIntelService(db)
+        result = svc.lookup_ioc(request.indicator, ioc_type)
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("[TI] lookup error:", exc)
+        raise HTTPException(status_code=500, detail="Threat intelligence lookup failed")
+
+
+@app.get("/api/v1/threat-intel/actors")
+def get_ti_actors(db: Session = Depends(get_db)):
+    """Return deduplicated threat actor profiles seen in enriched IOCs."""
+    try:
+        svc = ThreatIntelService(db)
+        return {"actors": svc.get_actors()}
+    except Exception as exc:
+        print("[TI] actors error:", exc)
+        raise HTTPException(status_code=500, detail="Failed to load threat actor data")
+
+
+@app.get("/api/v1/threat-intel/feeds/status")
+def get_ti_feed_status(db: Session = Depends(get_db)):
+    """Return the current status of all configured threat intelligence providers."""
+    try:
+        svc = ThreatIntelService(db)
+        return svc.get_feed_status()
+    except Exception as exc:
+        print("[TI] feed status error:", exc)
+        return {
+            "overall_status": "ERROR",
+            "label": "Unable to determine feed status",
+            "ioc_database": "ERROR",
+            "enrichment": "ERROR",
+            "last_updated": None,
+            "providers": [],
+        }

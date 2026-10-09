@@ -40,7 +40,7 @@ export default function LiveEventsPage() {
             const action = actionTypes[Math.floor(Math.random() * actionTypes.length)];
 
             const newEvent: NetworkEvent = {
-                id: `EVT-${Math.floor(Math.random() * 1000000)}`,
+                id: `${Date.now()}-EVT-${Math.floor(Math.random() * 1000000)}`,
                 timestamp: new Date().toISOString().split('T')[1].slice(0, -1),
                 sourceIp: DUMMY_IPS[Math.floor(Math.random() * DUMMY_IPS.length)],
                 user: DUMMY_USERS[Math.floor(Math.random() * DUMMY_USERS.length)],
